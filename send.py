@@ -1,137 +1,155 @@
 import os
+import sys
 import time
 from typing import List
 
 import can
 
+# CAN interface config
+CAN_INTERFACE = "slcan"
+CAN_CHANNEL   = "/dev/tty.usbmodem2095387B58421"
+CAN_BITRATE   = 500000
+
+# Lines per packet: 6 motors + 1 end-effector
+PACKET_SIZE = 7
+
+# End-effector CAN ID — used to skip speed adjustment for non-motor messages
+END_EFFECTOR_CAN_ID = 0x0D
+
 
 def parse_can_message(line: str) -> can.Message:
     """
-    Parses a single line from a file representing a CAN message.
+    Parses a single hex line from the .txt file into a can.Message.
+
+    Line format (16 hex chars, no spaces):
+        chars 0-1:   CAN arbitration ID
+        chars 2-13:  6 data bytes
+        chars 14-15: CRC byte
 
     Args:
-        line: A string representing a CAN message in the format "ID DATA".
+        line: 16-char hex string, e.g. "07F503E80200000081"
 
     Returns:
-        A `can.Message` object with the parsed arbitration ID and data bytes.
-
-    Note:
-        The arbitration ID is assumed to be the first two characters of the ID,
-        converted from hexadecimal. The data is assumed to be hexadecimal bytes,
-        where the first part of the data is directly following the ID in the
-        same string, and additional data parts are separated by spaces.
+        can.Message with arbitration_id and data populated.
     """
-    parts = line.split(" ")
-    arbitration_id = int(parts[0][:2], 16)
-    data = [int(parts[0][i : i + 2], 16) for i in range(2, len(parts[0]), 2)] + [
-        int(byte, 16) for byte in parts[1:]
-    ]
+    line = line.strip()
+    arbitration_id = int(line[:2], 16)
+    data           = [int(line[i:i+2], 16) for i in range(2, len(line), 2)]
     return can.Message(arbitration_id=arbitration_id, data=data, is_extended_id=False)
-
-
-def calculate_crc(arbitration_id: int, status: int) -> int:
-    """
-    Calculates a simple CRC value based on the arbitration ID and status.
-
-    Args:
-        arbitration_id: The arbitration ID of the CAN message.
-        status: An arbitrary status value.
-
-    Returns:
-        An integer representing the calculated CRC value.
-    """
-    return (arbitration_id + 0xF4 + status) & 0xFF
 
 
 def adjust_speeds_within_packet(messages: List[can.Message]) -> None:
     """
-    Adjusts the speeds within a packet of CAN messages based on the average speed.
+    Adjusts motor speeds within a packet to a common reference (average),
+    then recomputes CRC for any modified messages.
+
+    Skips the end-effector message (ID 0x0D) since it has no speed field.
+
+    CRC is sum of data bytes 0-6 mod 256 (does NOT include arbitration ID).
 
     Args:
-        messages: A list of `can.Message` objects, each representing a CAN message.
-
-    Note:
-        This function directly modifies the `data` attribute of each `can.Message`
-        object in the list to adjust the speed values.
+        messages: List of can.Message objects for one motion packet.
     """
-    speeds = [(msg.data[3] << 8) + msg.data[4] for msg in messages]
+    motor_messages = [m for m in messages if m.arbitration_id != END_EFFECTOR_CAN_ID]
+
+    if not motor_messages:
+        return
+
+    speeds = [(msg.data[1] << 8) + msg.data[2] for msg in motor_messages]
     reference_speed = sum(speeds) // len(speeds)
+
     if reference_speed == 0:
         return
-    for msg in messages:
-        speed = (msg.data[3] << 8) + msg.data[4]
+
+    for msg in motor_messages:
+        speed          = (msg.data[1] << 8) + msg.data[2]
         adjusted_speed = int((speed / reference_speed) * reference_speed)
-        msg.data[3] = (adjusted_speed >> 8) & 0xFF
-        msg.data[4] = adjusted_speed & 0xFF
+        msg.data[1]    = (adjusted_speed >> 8) & 0xFF
+        msg.data[2]    = adjusted_speed & 0xFF
+        # Recompute CRC over data bytes 0-6 only (no arbitration ID)
+        msg.data[7]    = sum(msg.data[:7]) & 0xFF
 
 
 def can_send_messages(bus: can.interface.Bus, messages: List[can.Message]) -> None:
     """
-    Sends a list of CAN messages through a specified CAN bus and waits for responses.
+    Sends all messages in a packet and waits for motor acknowledgements.
+
+    Expected responses are arbitration IDs 1 and 2 (MKS motor ACK IDs).
+    The end-effector (0x0D) does not send an ACK in this test setup.
 
     Args:
-        bus: The `can.interface.Bus` instance representing the CAN bus to send messages on.
-        messages: A list of `can.Message` objects to be sent.
-
-    Note:
-        This function waits for responses from expected motors after sending messages
-        and prints out the status of the sent and received messages.
+        bus:      Active CAN bus instance.
+        messages: List of can.Message objects to send.
     """
     expected_responses = {1, 2}
     received_responses = set()
+
     for msg in messages:
         bus.send(msg)
-        data_bytes = ", ".join([f"0x{byte:02X}" for byte in msg.data])
-        print(
-            f"Sent: arbitration_id=0x{msg.arbitration_id:X}, data=[{data_bytes}], is_extended_id=False"
-        )
-    timeout = 0.5
+        data_str = ", ".join([f"0x{b:02X}" for b in msg.data])
+        print(f"Sent:     arbitration_id=0x{msg.arbitration_id:02X}  data=[{data_str}]")
+
+    timeout    = 0.5
     start_time = time.time()
+
     while True:
         received_msg = bus.recv(timeout=3)
+
         if received_msg is not None:
-            received_data_bytes = ", ".join(
-                [f"0x{byte:02X}" for byte in received_msg.data]
-            )
-            print(
-                f"Received: arbitration_id=0x{received_msg.arbitration_id:X}, data=[{received_data_bytes}], is_extended_id=False"
-            )
+            data_str = ", ".join([f"0x{b:02X}" for b in received_msg.data])
+            print(f"Received: arbitration_id=0x{received_msg.arbitration_id:02X}  data=[{data_str}]")
+
             if received_msg.arbitration_id in expected_responses:
                 received_responses.add(received_msg.arbitration_id)
+
         if received_responses == expected_responses:
             if all(
                 received_msg.data[0] == 2 if received_msg is not None else False
                 for received_msg in [bus.recv(timeout=0.1)] * len(expected_responses)
             ):
-                print(
-                    "Responses received for all expected motors with status 2. Moving to the next set of messages."
-                )
+                print("All expected motors acknowledged with status 2. Moving to next packet.\n")
                 break
+
         if time.time() - start_time > timeout:
-            print("Timeout waiting for responses from expected motors with status 2.")
+            print("Timeout waiting for motor responses.\n")
             break
 
 
 def main() -> None:
     """
-    Main function to read CAN messages from a .txt file, send them through a CAN bus, and adjust speeds within packets.
+    Reads a .txt file of CAN messages, groups into 7-line packets
+    (6 motors + 1 end-effector), adjusts speeds, and sends over CAN.
+
+    Usage: python send.py [filename.txt]
+    Defaults to test.txt if no argument provided.
     """
-    script_directory = os.path.dirname(os.path.abspath(__file__))
-    txt_files = [file for file in os.listdir(script_directory) if file.endswith(".txt")]
-    if not txt_files:
-        print("No .txt files found in the script directory.")
+    script_dir    = os.path.dirname(os.path.abspath(__file__))
+    selected_file = sys.argv[1] if len(sys.argv) > 1 else "test.txt"
+    file_path     = os.path.join(script_dir, selected_file)
+
+    if not os.path.exists(file_path):
+        print(f"File not found: {file_path}")
         return
-    selected_file = txt_files[0]
-    file_path = os.path.join(script_directory, selected_file)
-    bus = can.interface.Bus(interface="slcan", channel="/dev/tty.usbmodem2095387B58421", bitrate=500000)  # Updated bitrate
-    with open(file_path, "r") as file:
-        lines = file.readlines()
-    message_sets = [lines[i : i + 6] for i in range(0, len(lines), 6)]
-    for message_set in message_sets:
-        messages = [parse_can_message(line.strip()) for line in message_set]
+
+    bus = can.interface.Bus(
+        interface=CAN_INTERFACE,
+        channel=CAN_CHANNEL,
+        bitrate=CAN_BITRATE,
+    )
+
+    with open(file_path, "r") as f:
+        lines = [l.strip() for l in f.readlines() if l.strip()]
+
+    message_sets = [lines[i:i+PACKET_SIZE] for i in range(0, len(lines), PACKET_SIZE)]
+
+    for i, message_set in enumerate(message_sets):
+        print(f"--- Packet {i+1}/{len(message_sets)} ---")
+        messages = [parse_can_message(line) for line in message_set]
         adjust_speeds_within_packet(messages)
         can_send_messages(bus, messages)
+
     bus.shutdown()
+    print("Done.")
 
 
 if __name__ == "__main__":
